@@ -1,19 +1,7 @@
-"""
-bonos-service
-=============
-Microservicio de BONOS / promociones del casino (FastAPI).
-
-Comparte la base de datos y el JWT con casino-backend. Permite:
-  - Consultar el catálogo de bonos.
-  - Reclamar un bono: acredita saldo al usuario y registra la transacción,
-    todo en una transacción SQL atómica (igual patrón que casino-backend).
-
-Prefijo de rutas: /api/bonos  (para que nginx pueda enrutar por prefijo).
-"""
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -23,7 +11,6 @@ from .db import conexion, dict_cursor, esperar_bd, init_schema
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Al arrancar: esperar la BD y asegurar/sembrar el esquema propio.
     esperar_bd()
     init_schema()
     yield
@@ -36,7 +23,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS para que el frontend Angular (localhost:4200) pueda llamar en desarrollo.
 _origenes = [o.strip() for o in os.getenv("CORS_ORIGIN", "http://localhost:4200").split(",")]
 app.add_middleware(
     CORSMiddleware,
@@ -48,20 +34,29 @@ app.add_middleware(
 
 
 class ReclamarRequest(BaseModel):
-    # Para bonos de tipo 'porcentaje' se calcula sobre este monto base
-    # (p.ej. lo que el usuario recarga o apostó). Ignorado en 'monto_fijo'.
     monto_base: float = Field(default=0, ge=0, description="Base para bonos por porcentaje")
 
 
-# TODO (alumno): implementar las rutas de salud que usará Kubernetes:
-#   - liveness: ¿el proceso está vivo? (respuesta simple).
-#   - readiness: ¿está listo para recibir tráfico? Debe verificar la BD.
-# Luego configurar livenessProbe/readinessProbe en el Deployment de EKS.
+@app.get("/livez", status_code=status.HTTP_200_OK)
+def liveness_probe():
+    return {"status": "alive"}
+
+
+@app.get("/readyz")
+def readiness_probe(response: Response):
+    try:
+        with conexion() as conn:
+            with dict_cursor(conn) as cur:
+                cur.execute("SELECT 1;")
+                cur.fetchone()
+        return {"status": "ready"}
+    except Exception as e:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "unready", "reason": str(e)}
 
 
 @app.get("/api/bonos")
 def listar_bonos():
-    """Catálogo de bonos activos (público)."""
     with conexion() as conn:
         with dict_cursor(conn) as cur:
             cur.execute(
@@ -73,7 +68,6 @@ def listar_bonos():
 
 @app.get("/api/bonos/mis-bonos")
 def mis_bonos(usuario: dict = Depends(usuario_actual)):
-    """Bonos ya reclamados por el usuario autenticado."""
     with conexion() as conn:
         with dict_cursor(conn) as cur:
             cur.execute(
@@ -89,13 +83,8 @@ def mis_bonos(usuario: dict = Depends(usuario_actual)):
 
 @app.post("/api/bonos/{codigo}/reclamar", status_code=201)
 def reclamar_bono(codigo: str, body: ReclamarRequest, usuario: dict = Depends(usuario_actual)):
-    """
-    Reclama un bono: calcula el monto, acredita saldo e inserta la transacción.
-    Todo dentro de una transacción atómica (ROLLBACK ante cualquier error).
-    """
     with conexion() as conn:
         with dict_cursor(conn) as cur:
-            # 1) Buscar el bono activo
             cur.execute(
                 "SELECT id, codigo, nombre, tipo, valor, un_solo_uso FROM bonos WHERE codigo = %s AND activo = TRUE",
                 (codigo,),
@@ -104,10 +93,9 @@ def reclamar_bono(codigo: str, body: ReclamarRequest, usuario: dict = Depends(us
             if bono is None:
                 raise HTTPException(status_code=404, detail=f"Bono '{codigo}' no encontrado")
 
-            # 2) Calcular el monto a otorgar
             if bono["tipo"] == "monto_fijo":
                 monto = float(bono["valor"])
-            else:  # porcentaje
+            else:
                 if body.monto_base <= 0:
                     raise HTTPException(
                         status_code=400,
@@ -115,7 +103,6 @@ def reclamar_bono(codigo: str, body: ReclamarRequest, usuario: dict = Depends(us
                     )
                 monto = round(body.monto_base * float(bono["valor"]) / 100.0, 2)
 
-            # 3) Si es de un solo uso, verificar que no lo haya reclamado antes
             if bono["un_solo_uso"]:
                 cur.execute(
                     "SELECT 1 FROM bonos_reclamados WHERE usuario_id = %s AND bono_id = %s",
@@ -124,7 +111,6 @@ def reclamar_bono(codigo: str, body: ReclamarRequest, usuario: dict = Depends(us
                 if cur.fetchone() is not None:
                     raise HTTPException(status_code=409, detail="Este bono ya fue reclamado")
 
-            # 4) Acreditar saldo + registrar transacción + registrar reclamo
             cur.execute(
                 "UPDATE usuarios SET saldo = saldo + %s WHERE id = %s RETURNING saldo",
                 (monto, usuario["id"]),
